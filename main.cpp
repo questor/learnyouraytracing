@@ -14,6 +14,9 @@ using namespace cml;
 
 #include "pcgrandom.h"
 
+#include "TinyJob/JobSystem.h"
+#include "TinyJob/Worker.h"
+
 int cNX = 200;
 int cNY = 100;
 int cMaxDepth = 50;
@@ -611,27 +614,73 @@ vector2f plastic(double index) {       //returns vector in [0..1[
    return vector2f(x,y);
 }
 
-// https://blog.demofox.org/2017/10/20/generating-blue-noise-sample-points-with-mitchells-best-candidate-algorithm/
-
 // ================================================================================
 
-vector3f computeColor(Ray& ray, Hitable *world, int depth) {
+vector3f computeColor(Ray& ray, Hitable *gWorld, int depth) {
    statistics.numberRays += 1;
 
    HitRecord record;
-   if(world->hit(ray, 0.001f, MAXFLOAT, record)) {
+   if(gWorld->hit(ray, 0.001f, MAXFLOAT, record)) {
       Ray scattered;
       vector3f attenuation;
       vector3f emitted = record.material->emitted(record.u, record.v, record.point);
 
       if(depth < cMaxDepth && record.material->scatter(ray, record, attenuation, scattered)) {
-         vector3f color = computeColor(scattered, world, depth+1);
+         vector3f color = computeColor(scattered, gWorld, depth+1);
          return emitted + vector3f(attenuation[0]*color[0], attenuation[1]*color[1], attenuation[2]*color[2]);
       } else {
          return emitted;
       }
    } else {
-      return vector3f(0.0f, 0.0f, 0.0f);
+      return vector3f(0.5f, 0.5f, 0.5f);
+   }
+}
+
+inline vector3f deNAN(const vector3f &c) {
+   vector3f temp = c;
+   if(!(temp[0] == temp[0])) temp[0] = 1.0f;
+   if(!(temp[1] == temp[1])) temp[1] = 1.0f;
+   if(!(temp[2] == temp[2])) temp[2] = 1.0f;
+   return temp;
+}
+
+typedef struct {
+   uint32_t *framebuffer;
+   uint32_t line;
+} JobDescription;
+
+int gNumberSamples;
+Camera *gCamera;
+Hitable *gWorld;
+
+void renderLine(void *data) {
+   JobDescription *descr = (JobDescription*)data;
+
+   uint32_t *dstFrameBuffer = descr->framebuffer + descr->line * cNX;
+
+   for(int x=0; x<cNX; ++x) {
+      float u = float(x) / float(cNX);
+      float v = float(cNY-descr->line) / float(cNY);
+
+      vector3f color(0.0f, 0.0f, 0.0f);
+      for(int sample=0; sample<gNumberSamples; ++sample) {
+         static double plasticIndex = 1;
+         vector2f p(plastic(plasticIndex));
+         ++plasticIndex;
+         float u = (float(x) + p[0]) / float(cNX);
+         float v = (float(cNY-descr->line) + p[1]) / float(cNY);
+         Ray ray = gCamera->getRay(u, v);
+         color += deNAN(computeColor(ray, gWorld, 0));
+      }
+      color /= float(gNumberSamples);
+
+      color = vector3f(sqrt(color[0]), sqrt(color[1]), sqrt(color[2]));       //gamma correct
+
+      int ir = int(255.99 * color[0]);
+      int ig = int(255.99 * color[1]);
+      int ib = int(255.99 * color[2]);
+
+      *(dstFrameBuffer++) = (0xff000000) | (ib<<16) | (ig<<8) | ir;
    }
 }
 
@@ -645,72 +694,55 @@ int main() {
    list[4] = new Sphere(vector3f(-1.0f, 0.0f, -1.0f), -0.45f, new Dielectric(1.5f));
 
    list[5] = new XYRect(3,5,1,3,-2,new DiffuseLight(new ConstantTexture(vector3f(4,4,4))));
-   Hitable *world = new HitableList(list, sizeof(list)/sizeof(list[0]));
+   gWorld = new HitableList(list, sizeof(list)/sizeof(list[0]));
 
    uint32_t *framebuffer = new uint32_t[cNX*cNY];
-
-   Camera camera;
 
    vector3f lookFrom(3.0f, 3.0f, 2.0f);
    vector3f lookAt(0.0f, 0.0f, -1.0f);
    float distanceToFocus = (lookFrom - lookAt).length();
-   float aperture = 2.0f;
-//   Camera camera(lookFrom, lookAt, vector3f(0,1,0), 20, float(cNX)/float(cNY), aperture, distanceToFocus);
+   float aperture = 0.1f;
+   gCamera = new Camera(lookFrom, lookAt, vector3f(0,1,0), 20, float(cNX)/float(cNY), aperture, distanceToFocus);
 
    statistics.numberRays = 0;
 
-//   int testNumberSamples[] = {1,10,20,30,50,100};
-   int testNumberSamples[] = {50};
-   for(int currentSample = 0; currentSample < sizeof(testNumberSamples)/sizeof(int); ++currentSample) {
-      int numberSamples = testNumberSamples[currentSample];
+   JobSystem jobSystem( 4, 65536 );
+   Job *fenceJob = jobSystem.CreateEmptyJob();
+   JobDescription *descriptions = new JobDescription[cNY];
 
-      printf("rendering with %d samples...\n", numberSamples);
+//   int testgNumberSamples[] = {1,10,20,30,50,100};
+   int testgNumberSamples[] = {30};
+   for(int currentSample = 0; currentSample < sizeof(testgNumberSamples)/sizeof(int); ++currentSample) {
+      gNumberSamples = testgNumberSamples[currentSample];
+
+      printf("rendering with %d samples...\n", gNumberSamples);
 
       std::chrono::high_resolution_clock::time_point startTime = std::chrono::high_resolution_clock::now();
+
       for(int y=0; y<cNY; ++y) {
-         for(int x=0; x<cNX; ++x) {
-            float u = float(x) / float(cNX);
-            float v = float(cNY-y) / float(cNY);
-
-            vector3f color(0.0f, 0.0f, 0.0f);
-            for(int sample=0; sample<numberSamples; ++sample) {
-#if 0
-               float u = (float(x)+rnd.randomf()) / float(cNX);
-               float v = (float(cNY-y)+rnd.randomf()) / float(cNY);
-#else
-               static double plasticIndex = 1;
-               vector2f p(plastic(plasticIndex));
-               ++plasticIndex;
-               float u = (float(x) + p[0]) / float(cNX);
-               float v = (float(cNY-y) + p[1]) / float(cNY);
-#endif
-               Ray ray = camera.getRay(u, v);
-               color += computeColor(ray, world, 0);
-            }
-            color /= float(numberSamples);
-
-            color = vector3f(sqrt(color[0]), sqrt(color[1]), sqrt(color[2]));       //gamma correct
-
-            int ir = int(255.99 * color[0]);
-            int ig = int(255.99 * color[1]);
-            int ib = int(255.99 * color[2]);
-
-            framebuffer[y*cNX + x] = (0xff000000) | (ib<<16) | (ig<<8) | ir;
-         }
+         descriptions[y].framebuffer = framebuffer;
+         descriptions[y].line = y;
+         Job *job = jobSystem.CreateJobAsChild(renderLine, fenceJob, &descriptions[y]);
+         jobSystem.Run(job);
       }
+
+      jobSystem.Run(fenceJob);
+      jobSystem.Wait(fenceJob);
 
       std::chrono::high_resolution_clock::time_point raytraceTime = std::chrono::high_resolution_clock::now();
 
-      printf("raytracing with %d samples took %lu ms\n", numberSamples, std::chrono::duration_cast<std::chrono::milliseconds>(raytraceTime - startTime).count());
+      printf("raytracing with %d samples took %lu ms\n", gNumberSamples, std::chrono::duration_cast<std::chrono::milliseconds>(raytraceTime - startTime).count());
 
       char filename[256];
-      sprintf(filename, "raytrace_plastic_%03d.png", numberSamples);
+      sprintf(filename, "raytrace_plastic_%03d.png", gNumberSamples);
       stbi_write_png(filename, cNX, cNY, 4, framebuffer, cNX*sizeof(uint32_t));
    }
 
-
+   delete[] descriptions;
+   delete fenceJob;
+   delete gCamera;
    delete[] framebuffer;
-   delete world;
+   delete gWorld;
 
    printf("-----------------\n");
    printf("number rays: %d\n", statistics.numberRays);
