@@ -279,6 +279,17 @@ public:
    }
 
    bool hit(Ray &ray, float timeMin, float timeMax, HitRecord &record) {
+#if 1
+      if(mAABB.hit(ray, timeMin, timeMax)) {
+         if(mLeft->hit(ray, timeMin, timeMax, record)) {
+            mRight->hit(ray, timeMin, record.time, record);
+            return true;
+         } else {
+            return mRight->hit(ray, timeMin, timeMax, record);
+         }
+      }
+#endif
+#if 0
       if(mAABB.hit(ray, timeMin, timeMax)) {
          HitRecord leftRecord, rightRecord;
          bool hitLeft = mLeft->hit(ray, timeMin, timeMax, leftRecord);
@@ -299,6 +310,7 @@ public:
          }
          return false;
       }
+#endif
       return false;
    }
 
